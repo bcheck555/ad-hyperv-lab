@@ -1,0 +1,72 @@
+---
+- name: Configure Windows Hyper-V host
+  hosts: windows
+  gather_facts: false
+  vars:
+    target_hostname: hyperv1
+
+  tasks:
+    - name: Check Windows connectivity
+      ansible.windows.win_ping:
+
+    - name: Set hostname to hyperv1
+      ansible.windows.win_hostname:
+        name: "{{ target_hostname }}"
+      register: hostname_result
+
+    - name: Reboot after hostname change
+      ansible.windows.win_reboot:
+        reboot_timeout: 1800
+      when: hostname_result.reboot_required | default(false)
+
+    - name: Install Hyper-V role and management tools
+      ansible.windows.win_feature:
+        name:
+          - Hyper-V
+          - Hyper-V-PowerShell
+        state: present
+        include_management_tools: true
+      register: hyperv_features
+
+    - name: Reboot after Hyper-V installation
+      ansible.windows.win_reboot:
+        reboot_timeout: 2400
+      when: hyperv_features.reboot_required | default(false)
+
+    - name: Ensure OpenSSH Server service is running
+      ansible.windows.win_service:
+        name: sshd
+        start_mode: auto
+        state: started
+
+    - name: Ensure SSH firewall rule is present
+      ansible.windows.win_firewall_rule:
+        name: OpenSSH-Server-In-TCP
+        localport: 22
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
+        enabled: true
+
+    - name: Verify Hyper-V role installation
+      ansible.windows.win_shell: |
+        $feature = Get-WindowsFeature -Name Hyper-V
+        if (-not $feature.Installed) { throw "Hyper-V is not installed" }
+        Get-WindowsFeature -Name Hyper-V,Hyper-V-PowerShell | Format-Table -AutoSize
+      register: hyperv_verify
+      changed_when: false
+
+    - name: Check virtualization firmware exposure
+      ansible.windows.win_shell: |
+        Get-ComputerInfo -Property HyperVRequirement* | Format-List
+      register: hyperv_requirements
+      changed_when: false
+
+    - name: Print Hyper-V verification
+      ansible.builtin.debug:
+        var: hyperv_verify.stdout_lines
+
+    - name: Print virtualization requirement details
+      ansible.builtin.debug:
+        var: hyperv_requirements.stdout_lines
