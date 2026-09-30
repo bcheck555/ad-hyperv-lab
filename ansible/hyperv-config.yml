@@ -3,13 +3,27 @@
   hosts: windows
   gather_facts: false
   vars:
-    target_hostname: hyperv1
+    target_hostname: "{{ inventory_hostname }}"
+    hyperv_switch_name: LabNAT
+    hyperv_nat_name: LabNAT
+    hyperv_nat_prefix: 192.168.100.0/24
+    hyperv_nat_gateway: 192.168.100.1
+    git_partition_size_gib: 64
+
+  pre_tasks:
+    - name: Require supported ansible-core version
+      ansible.builtin.assert:
+        that: ansible_version.full is version('2.18', '>=')
+        fail_msg: >-
+          This project requires ansible-core 2.18 or newer. Install the project
+          requirements and run .venv/bin/ansible-playbook.
+        quiet: true
 
   tasks:
     - name: Check Windows connectivity
       ansible.windows.win_ping:
 
-    - name: Set hostname to hyperv1
+    - name: Set configured hostname
       ansible.windows.win_hostname:
         name: "{{ target_hostname }}"
       register: hostname_result
@@ -19,6 +33,11 @@
         reboot_timeout: 1800
       when: hostname_result.reboot_required | default(false)
 
+    - name: Check whether Hyper-V management service exists
+      ansible.windows.win_service_info:
+        name: vmms
+      register: hyperv_service
+
     - name: Install Hyper-V role and management tools
       ansible.windows.win_feature:
         name:
@@ -27,11 +46,121 @@
         state: present
         include_management_tools: true
       register: hyperv_features
+      when: not hyperv_service.exists
 
     - name: Reboot after Hyper-V installation
       ansible.windows.win_reboot:
         reboot_timeout: 2400
       when: hyperv_features.reboot_required | default(false)
+
+    - name: Ensure QEMU guest agent is running
+      ansible.windows.win_service:
+        name: QEMU-GA
+        start_mode: auto
+        state: started
+
+    - name: Initialize and partition the Hyper-V data disk
+      ansible.windows.win_shell: |
+        $gitVolume = Get-Volume -FileSystemLabel 'GitData' -ErrorAction SilentlyContinue
+        $vmVolume = Get-Volume -FileSystemLabel 'HyperVData' -ErrorAction SilentlyContinue
+
+        if ($null -ne $gitVolume -and $null -ne $vmVolume) {
+          'present'
+          exit 0
+        }
+
+        if ($null -ne $gitVolume -or $null -ne $vmVolume) {
+          throw 'Only one expected data volume exists; refusing to repartition the disk'
+        }
+
+        $rawDisks = @(Get-Disk | Where-Object PartitionStyle -eq 'RAW')
+        if ($rawDisks.Count -ne 1) {
+          throw "Expected exactly one raw data disk, found $($rawDisks.Count)"
+        }
+
+        $disk = $rawDisks[0] | Initialize-Disk -PartitionStyle GPT -PassThru
+        $gitPartition = New-Partition -DiskNumber $disk.Number -Size {{ git_partition_size_gib }}GB -DriveLetter D
+        $gitPartition | Format-Volume -FileSystem NTFS -NewFileSystemLabel 'GitData' -AllocationUnitSize 4096 -Confirm:$false | Out-Null
+        $vmPartition = New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter E
+        $vmPartition | Format-Volume -FileSystem NTFS -NewFileSystemLabel 'HyperVData' -AllocationUnitSize 65536 -Confirm:$false | Out-Null
+        'changed'
+      register: data_disk
+      changed_when: "'changed' in data_disk.stdout"
+
+    - name: Create Git repository directory
+      ansible.windows.win_file:
+        path: D:\Git
+        state: directory
+
+    - name: Create Hyper-V virtual disk directory
+      ansible.windows.win_file:
+        path: E:\Hyper-V\Virtual Hard Disks
+        state: directory
+
+    - name: Create Hyper-V virtual machine directory
+      ansible.windows.win_file:
+        path: E:\Hyper-V\Virtual Machines
+        state: directory
+
+    - name: Configure Hyper-V default storage paths
+      ansible.windows.win_shell: |
+        $desiredVhdPath = 'E:\Hyper-V\Virtual Hard Disks'
+        $desiredVmPath = 'E:\Hyper-V\Virtual Machines'
+        $hostConfig = Get-VMHost
+        if ($hostConfig.VirtualHardDiskPath -ne $desiredVhdPath -or $hostConfig.VirtualMachinePath -ne $desiredVmPath) {
+          Set-VMHost -VirtualHardDiskPath $desiredVhdPath -VirtualMachinePath $desiredVmPath
+          'changed'
+        } else {
+          'present'
+        }
+      register: hyperv_storage
+      changed_when: "'changed' in hyperv_storage.stdout"
+
+    - name: Configure internal Hyper-V switch and NAT
+      ansible.windows.win_shell: |
+        $changed = $false
+        $switchName = '{{ hyperv_switch_name }}'
+        $natName = '{{ hyperv_nat_name }}'
+        $gateway = '{{ hyperv_nat_gateway }}'
+        $prefix = '{{ hyperv_nat_prefix }}'
+
+        $switch = Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue
+        if ($null -eq $switch) {
+          New-VMSwitch -Name $switchName -SwitchType Internal | Out-Null
+          $changed = $true
+        } elseif ($switch.SwitchType -ne 'Internal') {
+          throw "Hyper-V switch $switchName exists but is not an internal switch"
+        }
+
+        $adapterAlias = "vEthernet ($switchName)"
+        $adapter = Get-NetAdapter -Name $adapterAlias -ErrorAction Stop
+        $gatewayAddress = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+          Where-Object IPAddress -eq $gateway
+        if ($null -eq $gatewayAddress) {
+          New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $gateway -PrefixLength 24 | Out-Null
+          $changed = $true
+        }
+
+        $nat = Get-NetNat -Name $natName -ErrorAction SilentlyContinue
+        if ($null -eq $nat) {
+          New-NetNat -Name $natName -InternalIPInterfaceAddressPrefix $prefix | Out-Null
+          $changed = $true
+        } elseif ($nat.InternalIPInterfaceAddressPrefix -ne $prefix) {
+          throw "NAT $natName exists with prefix $($nat.InternalIPInterfaceAddressPrefix), expected $prefix"
+        }
+
+        if ($changed) { 'changed' } else { 'present' }
+      register: hyperv_nat
+      changed_when: "'changed' in hyperv_nat.stdout"
+
+    - name: Verify data disk and Hyper-V defaults
+      ansible.windows.win_shell: |
+        Get-Volume -FileSystemLabel 'GitData','HyperVData' | Format-Table DriveLetter,FileSystemLabel,FileSystem,AllocationUnitSize,Size,SizeRemaining -AutoSize
+        Get-VMHost | Format-List VirtualHardDiskPath,VirtualMachinePath
+        Get-VMSwitch -Name '{{ hyperv_switch_name }}' | Format-List Name,SwitchType
+        Get-NetNat -Name '{{ hyperv_nat_name }}' | Format-List Name,InternalIPInterfaceAddressPrefix
+      register: storage_verify
+      changed_when: false
 
     - name: Ensure OpenSSH Server service is running
       ansible.windows.win_service:
@@ -40,33 +169,107 @@
         state: started
 
     - name: Ensure SSH firewall rule is present
-      ansible.windows.win_firewall_rule:
-        name: OpenSSH-Server-In-TCP
-        localport: 22
-        action: allow
-        direction: in
-        protocol: tcp
-        state: present
-        enabled: true
+      ansible.windows.win_shell: |
+        $rule = Get-NetFirewallRule -Name OpenSSH-Server-In-TCP -ErrorAction SilentlyContinue
+        if ($null -eq $rule) {
+          New-NetFirewallRule -Name OpenSSH-Server-In-TCP -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Profile Any -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+          'created'
+        } else {
+          Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -Enabled True -Profile Any -Direction Inbound -Action Allow | Out-Null
+          Get-NetFirewallRule -Name OpenSSH-Server-In-TCP | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol TCP -LocalPort 22
+          'present'
+        }
+      register: ssh_firewall
+      changed_when: "'created' in ssh_firewall.stdout"
+
+    - name: Ensure Remote Desktop connections are allowed
+      ansible.windows.win_regedit:
+        path: HKLM:\System\CurrentControlSet\Control\Terminal Server
+        name: fDenyTSConnections
+        data: 0
+        type: dword
+
+    - name: Ensure Remote Desktop requires Network Level Authentication
+      ansible.windows.win_regedit:
+        path: HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+        name: UserAuthentication
+        data: 1
+        type: dword
+
+    - name: Ensure Remote Desktop Services service is running
+      ansible.windows.win_service:
+        name: TermService
+        start_mode: auto
+        state: started
+
+    - name: Ensure RDP firewall rules are present
+      ansible.windows.win_shell: |
+        $changed = $false
+        $desiredRules = @(
+          @{ Name = 'RemoteDesktop-UserMode-In-TCP'; DisplayName = 'Remote Desktop - User Mode (TCP-In)'; Protocol = 'TCP'; LocalPort = '3389' },
+          @{ Name = 'RemoteDesktop-UserMode-In-UDP'; DisplayName = 'Remote Desktop - User Mode (UDP-In)'; Protocol = 'UDP'; LocalPort = '3389' }
+        )
+
+        foreach ($desired in $desiredRules) {
+          $rule = Get-NetFirewallRule -Name $desired.Name -ErrorAction SilentlyContinue
+          if ($null -eq $rule) {
+            New-NetFirewallRule -Name $desired.Name -DisplayName $desired.DisplayName -Enabled True -Profile Any -Direction Inbound -Protocol $desired.Protocol -Action Allow -LocalPort $desired.LocalPort | Out-Null
+            $changed = $true
+          } else {
+            if ($rule.Enabled -ne 'True' -or $rule.Profile -ne 'Any' -or $rule.Action -ne 'Allow') {
+              $changed = $true
+            }
+            Set-NetFirewallRule -Name $desired.Name -Enabled True -Profile Any -Direction Inbound -Action Allow | Out-Null
+            Get-NetFirewallRule -Name $desired.Name | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol $desired.Protocol -LocalPort $desired.LocalPort
+          }
+        }
+
+        Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+        if ($changed) { 'changed' } else { 'present' }
+      register: rdp_firewall
+      changed_when: "'changed' in rdp_firewall.stdout"
+
+    - name: Verify RDP readiness
+      ansible.windows.win_shell: |
+        $deny = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections
+        if ($deny -ne 0) { throw "RDP connections are still denied" }
+        $tcpRule = Get-NetFirewallRule -Name RemoteDesktop-UserMode-In-TCP -ErrorAction Stop
+        if ($tcpRule.Enabled -ne 'True') { throw "RDP TCP firewall rule is not enabled" }
+        Get-Service -Name TermService | Format-List Name,Status,StartType
+        Get-NetFirewallRule -Name RemoteDesktop-UserMode-In-TCP,RemoteDesktop-UserMode-In-UDP | Format-Table Name,Enabled,Profile,Action -AutoSize
+      register: rdp_verify
+      changed_when: false
 
     - name: Verify Hyper-V role installation
       ansible.windows.win_shell: |
-        $feature = Get-WindowsFeature -Name Hyper-V
-        if (-not $feature.Installed) { throw "Hyper-V is not installed" }
-        Get-WindowsFeature -Name Hyper-V,Hyper-V-PowerShell | Format-Table -AutoSize
+        $service = Get-Service -Name vmms -ErrorAction Stop
+        if ($service.Status -ne 'Running') { throw "Hyper-V Virtual Machine Management is not running" }
+        Get-Service -Name vmms | Format-List Name,Status,StartType
+        Get-Command -Name Get-VMHost | Format-List Name,ModuleName
       register: hyperv_verify
       changed_when: false
 
-    - name: Check virtualization firmware exposure
+    - name: Check Hyper-V hypervisor state
       ansible.windows.win_shell: |
-        Get-ComputerInfo -Property HyperVRequirement* | Format-List
+        $computer = Get-CimInstance Win32_ComputerSystem
+        if (-not $computer.HypervisorPresent) { throw "The Hyper-V hypervisor is not running" }
+        $computer | Select-Object Name,HypervisorPresent | Format-List
       register: hyperv_requirements
       changed_when: false
+
+    - name: Print RDP verification
+      ansible.builtin.debug:
+        var: rdp_verify.stdout_lines
 
     - name: Print Hyper-V verification
       ansible.builtin.debug:
         var: hyperv_verify.stdout_lines
 
-    - name: Print virtualization requirement details
+    - name: Print Hyper-V hypervisor state
       ansible.builtin.debug:
         var: hyperv_requirements.stdout_lines
+
+    - name: Print storage and nested-network verification
+      ansible.builtin.debug:
+        var: storage_verify.stdout_lines

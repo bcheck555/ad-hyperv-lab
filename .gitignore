@@ -2,10 +2,13 @@
 __pycache__/
 *.py[cod]
 .hermes/
+.venv/
 ISOs/*.iso
 output/
 ansible/inventory.ini
+ansible/known_hosts
 terraform/.terraform/
-terraform/.terraform.lock.hcl
-terraform/terraform.tfstate
-terraform/terraform.tfstate.backup
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/tfplan
+terraform/*.tfplan

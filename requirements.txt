@@ -1,0 +1,2 @@
+ansible-core>=2.18,<2.21
+pywinrm>=0.5,<0.6
