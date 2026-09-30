@@ -9,6 +9,17 @@
     hyperv_nat_prefix: 192.168.100.0/24
     hyperv_nat_gateway: 192.168.100.1
     git_partition_size_gib: 64
+    packer_minimum_version: "1.9.0"
+    chocolatey_packages:
+      - name: git
+        state: present
+      - name: packer
+        state: latest
+      - name: docker-desktop
+        state: latest
+    opentofu_architecture: amd64
+    opentofu_install_dir: 'C:\Program Files\OpenTofu'
+    opentofu_release_api_url: https://api.github.com/repos/opentofu/opentofu/releases/latest
 
   pre_tasks:
     - name: Require supported ansible-core version
@@ -52,6 +63,117 @@
       ansible.windows.win_reboot:
         reboot_timeout: 2400
       when: hyperv_features.reboot_required | default(false)
+
+    - name: Ensure Chocolatey is installed
+      chocolatey.chocolatey.win_chocolatey:
+        name: chocolatey
+        state: present
+
+    - name: Install ADLabV2 Chocolatey prerequisites
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+      loop: "{{ chocolatey_packages }}"
+      register: host_package_install
+
+    - name: Reboot after prerequisite package installation
+      ansible.windows.win_reboot:
+        reboot_timeout: 2400
+      when: >-
+        host_package_install.results
+        | selectattr('reboot_required', 'defined')
+        | selectattr('reboot_required')
+        | list
+        | length > 0
+
+    - name: Install the latest stable OpenTofu release
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $releaseHeaders = @{
+            Accept = 'application/vnd.github+json'
+            'User-Agent' = 'ad-hyperv-lab-ansible'
+          }
+          $release = Invoke-RestMethod -Uri '{{ opentofu_release_api_url }}' -Headers $releaseHeaders
+          if ($release.draft -or $release.prerelease) {
+            throw "OpenTofu release API returned a draft or prerelease: $($release.tag_name)"
+          }
+
+          $targetVersion = $release.tag_name.TrimStart('v')
+          $archiveName = "tofu_$($targetVersion)_windows_{{ opentofu_architecture }}.zip"
+          $checksumsName = "tofu_$($targetVersion)_SHA256SUMS"
+          $archiveAsset = $release.assets | Where-Object { $_.name -eq $archiveName }
+          $checksumsAsset = $release.assets | Where-Object { $_.name -eq $checksumsName }
+          if ($null -eq $archiveAsset -or $null -eq $checksumsAsset) {
+            throw "OpenTofu release $($release.tag_name) is missing $archiveName or $checksumsName"
+          }
+
+          $installDir = '{{ opentofu_install_dir }}'
+          $tofuExe = Join-Path $installDir 'tofu.exe'
+          if (Test-Path -LiteralPath $tofuExe) {
+            $versionOutput = (& $tofuExe version | Select-Object -First 1)
+            if ($versionOutput -match 'OpenTofu v(?<version>[0-9]+\.[0-9]+\.[0-9]+)') {
+              if ([version]$Matches.version -ge [version]$targetVersion) {
+                $Ansible.Changed = $false
+                $Ansible.Result = @{ version = $Matches.version; path = $tofuExe }
+                return
+              }
+            }
+          }
+
+          $stagingDir = Join-Path $env:TEMP "opentofu-$targetVersion"
+          $archivePath = Join-Path $stagingDir $archiveName
+          $checksumsPath = Join-Path $stagingDir $checksumsName
+          try {
+            if (Test-Path -LiteralPath $stagingDir) {
+              Remove-Item -LiteralPath $stagingDir -Recurse -Force
+            }
+            New-Item -Path $stagingDir -ItemType Directory -Force | Out-Null
+            Invoke-WebRequest -Uri $archiveAsset.browser_download_url -OutFile $archivePath -UseBasicParsing
+            Invoke-WebRequest -Uri $checksumsAsset.browser_download_url -OutFile $checksumsPath -UseBasicParsing
+            $escapedArchiveName = [regex]::Escape($archiveName)
+            $checksumLine = Get-Content -LiteralPath $checksumsPath |
+              Where-Object { $_ -match "^(?<hash>[0-9a-fA-F]{64})\s+\*?$escapedArchiveName$" } |
+              Select-Object -First 1
+            if ($null -eq $checksumLine) {
+              throw "No SHA-256 checksum was published for $archiveName"
+            }
+            $checksumLine -match '^(?<hash>[0-9a-fA-F]{64})' | Out-Null
+            $expectedHash = $Matches.hash.ToLowerInvariant()
+            $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+              throw "OpenTofu checksum mismatch for $archiveName; expected $expectedHash, got $actualHash"
+            }
+            $expandedDir = Join-Path $stagingDir 'expanded'
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $expandedDir -Force
+            $expandedExe = Get-ChildItem -LiteralPath $expandedDir -Filter tofu.exe -Recurse | Select-Object -First 1
+            if ($null -eq $expandedExe) {
+              throw "$archiveName did not contain tofu.exe"
+            }
+            New-Item -Path $installDir -ItemType Directory -Force | Out-Null
+            Copy-Item -LiteralPath $expandedExe.FullName -Destination $tofuExe -Force
+            $Ansible.Changed = $true
+            $Ansible.Result = @{ version = $targetVersion; path = $tofuExe }
+          }
+          finally {
+            if (Test-Path -LiteralPath $stagingDir) {
+              Remove-Item -LiteralPath $stagingDir -Recurse -Force
+            }
+          }
+
+    - name: Add OpenTofu to the machine PATH
+      ansible.windows.win_path:
+        elements:
+          - "{{ opentofu_install_dir }}"
+        scope: machine
+        state: present
+
+    - name: Ensure Docker Desktop service is running automatically
+      ansible.windows.win_service:
+        name: com.docker.service
+        start_mode: auto
+        state: started
 
     - name: Ensure QEMU guest agent is running
       ansible.windows.win_service:
@@ -162,6 +284,36 @@
       register: storage_verify
       changed_when: false
 
+    - name: Install OpenSSH Server capability
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
+          $capability = Get-WindowsCapability -Online -Name $capabilityName
+          $restartNeeded = $false
+          if ($capability.State -ne 'Installed') {
+            $result = Add-WindowsCapability -Online -Name $capabilityName
+            if ($result.State -ne 'Installed') {
+              throw "OpenSSH Server installation finished in state $($result.State)"
+            }
+            $restartNeeded = [bool]$result.RestartNeeded
+            $Ansible.Changed = $true
+          }
+          else {
+            $Ansible.Changed = $false
+          }
+          $Ansible.Result = @{
+            name = $capabilityName
+            state = 'Installed'
+            restart_needed = $restartNeeded
+          }
+      register: openssh_capability
+
+    - name: Reboot after OpenSSH Server installation
+      ansible.windows.win_reboot:
+        reboot_timeout: 1800
+      when: openssh_capability.result.restart_needed | default(false) | bool
+
     - name: Ensure OpenSSH Server service is running
       ansible.windows.win_service:
         name: sshd
@@ -257,6 +409,68 @@
         $computer | Select-Object Name,HypervisorPresent | Format-List
       register: hyperv_requirements
       changed_when: false
+
+    - name: Verify ADLabV2 host prerequisites
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-VersionCommand {
+            param(
+              [Parameter(Mandatory)]
+              [string]$Command,
+              [string[]]$Arguments = @()
+            )
+            $resolved = Get-Command -Name $Command -ErrorAction Stop
+            $output = & $resolved.Source @Arguments 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw ('{0} {1} failed with exit code {2}: {3}' -f $Command, ($Arguments -join ' '), $LASTEXITCODE, $output)
+            }
+            ($output | Out-String).Trim()
+          }
+
+          $gitVersion = Invoke-VersionCommand -Command git.exe -Arguments @('--version')
+          $packerVersion = Invoke-VersionCommand -Command packer.exe -Arguments @('version')
+          $tofuVersion = Invoke-VersionCommand -Command tofu.exe -Arguments @('version')
+          $dockerVersion = Invoke-VersionCommand -Command docker.exe -Arguments @('--version')
+          $dockerComposeVersion = Invoke-VersionCommand -Command docker.exe -Arguments @('compose', 'version')
+          $dockerComposeLegacyVersion = Invoke-VersionCommand -Command docker-compose.exe -Arguments @('version')
+          if ($packerVersion -notmatch 'Packer v?(?<version>[0-9]+\.[0-9]+\.[0-9]+)') {
+            throw "Unable to parse Packer version from: $packerVersion"
+          }
+          if ([version]$Matches.version -lt [version]'{{ packer_minimum_version }}') {
+            throw "Packer $($Matches.version) is older than required version {{ packer_minimum_version }}"
+          }
+
+          $sshCapability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+          if ($sshCapability.State -ne 'Installed') {
+            throw "OpenSSH Server capability state is $($sshCapability.State), expected Installed"
+          }
+          $sshd = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'"
+          if ($null -eq $sshd -or $sshd.State -ne 'Running' -or $sshd.StartMode -ne 'Auto') {
+            throw 'sshd must be running with automatic startup'
+          }
+          $sshFirewallRule = Get-NetFirewallRule -Name OpenSSH-Server-In-TCP -ErrorAction Stop
+          $sshPortFilter = $sshFirewallRule | Get-NetFirewallPortFilter
+          if ($sshFirewallRule.Enabled -ne 'True' -or $sshFirewallRule.Action -ne 'Allow' -or
+              $sshPortFilter.Protocol -ne 'TCP' -or $sshPortFilter.LocalPort -notcontains '22') {
+            throw 'OpenSSH firewall rule must allow inbound TCP port 22'
+          }
+
+          [PSCustomObject]@{
+            Git = $gitVersion
+            Packer = $packerVersion
+            OpenTofu = $tofuVersion
+            Docker = $dockerVersion
+            DockerCompose = $dockerComposeVersion
+            DockerComposeLegacy = $dockerComposeLegacyVersion
+            OpenSSH = "$($sshCapability.State); sshd=$($sshd.State)/$($sshd.StartMode)"
+          }
+      register: prerequisite_verify
+      changed_when: false
+
+    - name: Print ADLabV2 prerequisite verification
+      ansible.builtin.debug:
+        var: prerequisite_verify.output
 
     - name: Print RDP verification
       ansible.builtin.debug:

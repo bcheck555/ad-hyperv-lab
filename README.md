@@ -42,7 +42,7 @@ Required commands/tools:
 - Python 3 with `venv`
 - `numactl`
 - ansible-core 2.18 or newer and `pywinrm` (installed from `requirements.txt`)
-- Ansible collection: `ansible.windows`
+- Ansible collections listed in `requirements.yml`
 
 Install the pinned Ansible controller dependency and Windows collection in the
 project virtual environment:
@@ -50,8 +50,11 @@ project virtual environment:
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/ansible-galaxy collection install ansible.windows
+.venv/bin/ansible-galaxy collection install -r requirements.yml
 ```
+
+The Ansible run needs outbound HTTPS access from the Windows guest to the
+Chocolatey community feed, the GitHub API, and OpenTofu release downloads.
 
 Download the stable `virtio-win.iso` from the
 [virtio-win project](https://github.com/virtio-win/virtio-win-pkg-scripts/blob/master/README.md)
@@ -223,6 +226,20 @@ The first run may reboot the VM after hostname and Hyper-V role changes. Run it 
 ```bash
 .venv/bin/ansible-playbook -i ansible/inventory.ini ansible/hyperv-config.yml
 ```
+
+The playbook also prepares this VM to act as the ADLabV2 Hyper-V host. It
+installs Git, the current stable Packer release, the current stable OpenTofu
+release, Docker Desktop, and the Windows OpenSSH Server capability, then checks
+their versions and service state. OpenTofu is installed from its official
+release archive after SHA-256 verification because the Chocolatey community
+feed does not publish a stable OpenTofu package.
+
+> [!WARNING]
+> Docker Desktop does not support Windows Server. The playbook attempts the
+> installation because ADLabV2 uses Docker Desktop for its initial Linux
+> Ansible-container bootstrap, but Docker Desktop installation or startup can
+> fail on this Windows Server 2025 host. See the
+> [Docker Desktop Windows requirements](https://docs.docker.com/desktop/setup/install/windows-install/).
 
 The data disk is initialized once with GPT and split into:
 
