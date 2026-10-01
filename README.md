@@ -216,6 +216,12 @@ virsh net-dhcp-leases default
 
 ## Configure Hyper-V with Ansible
 
+Export the shared lab password in the current shell so Ansible can read it:
+
+```bash
+export AD_LAB_ADMIN_PASSWORD
+```
+
 Check connectivity:
 
 ```bash
