@@ -92,14 +92,19 @@ The script reports missing tools, `/dev/kvm` availability, nested KVM status, li
 Run Packer from the `packer/` directory so relative paths resolve correctly:
 
 ```bash
-export AD_LAB_ADMIN_PASSWORD='choose-a-unique-lab-password'
-export PKR_VAR_admin_password="$AD_LAB_ADMIN_PASSWORD"
+read -r -s -p "Shared lab password: " AD_LAB_ADMIN_PASSWORD
+printf '\n'
+export AD_LAB_ADMIN_PASSWORD
 
 cd packer
 packer init windows-server-2025-qemu.pkr.hcl
-packer validate windows-server-2025-qemu.pkr.hcl
-PACKER_LOG=1 packer build -force -on-error=cleanup windows-server-2025-qemu.pkr.hcl 2>&1 | tee ../packer_qemu_build.log
+PKR_VAR_admin_password="$AD_LAB_ADMIN_PASSWORD" packer validate windows-server-2025-qemu.pkr.hcl
+PKR_VAR_admin_password="$AD_LAB_ADMIN_PASSWORD" packer build -force -on-error=cleanup windows-server-2025-qemu.pkr.hcl
 ```
+
+Packer receives its required sensitive variable through the child-process
+environment; the password is not passed as a command-line argument or written
+to a build log.
 
 The QEMU builder starts `qemu-system-x86_64` directly, so its temporary build VM
 does not appear in `virsh list`. Use the VNC URL printed by Packer to watch the
@@ -185,13 +190,15 @@ The `rdp_endpoints` output reports reachable RDP targets as `IP:3389` values. Wi
 After `terraform apply`, generate `ansible/inventory.ini` from the Terraform `vm_addresses` output:
 
 ```bash
-export AD_LAB_ADMIN_PASSWORD='the-same-password-used-for-packer'
-
 cd ..
 python3 scripts/render-ansible-inventory.py
 ```
 
-The generated inventory is mode `0600` and uses WinRM over HTTP with NTLM message encryption. Basic authentication and unencrypted WinRM messages remain disabled.
+The renderer requires `AD_LAB_ADMIN_PASSWORD` to be set but does not write it to
+the inventory. Ansible reads it from the process environment; the generated
+inventory is mode `0600` and contains only host and connection details. WinRM
+uses NTLM message encryption; Basic authentication and unencrypted WinRM
+messages remain disabled.
 
 If Terraform does not discover a DHCP lease, inspect the VM manually and copy the example inventory:
 
@@ -269,7 +276,7 @@ Force rebuild the base image:
 ```bash
 rm -rf output/windows-server-2025-base
 cd packer
-packer build -force -on-error=cleanup windows-server-2025-qemu.pkr.hcl
+PKR_VAR_admin_password="$AD_LAB_ADMIN_PASSWORD" packer build -force -on-error=cleanup windows-server-2025-qemu.pkr.hcl
 ```
 
 Remove generated local inventory:
@@ -285,7 +292,8 @@ rm -f ansible/inventory.ini ansible/known_hosts
 - The 500 GiB raw disk is preallocated. Initial creation can take time, but avoids an outer qcow2 copy-on-write layer beneath nested VHDX files.
 - The current host stores libvirt images on rotational storage. Moving the pool to SSD or NVMe will improve nested VM responsiveness more than further virtual device tuning.
 - RDP is enabled inside Windows by Packer and re-asserted by Ansible. Terraform only reports the discovered guest endpoint; it does not configure host-side NAT port forwarding for TCP/UDP 3389.
-- Set both `AD_LAB_ADMIN_PASSWORD` and `PKR_VAR_admin_password` in the current shell; no default password is stored in the repository.
+- Set only `AD_LAB_ADMIN_PASSWORD` in the current shell; Packer receives its variable through a temporary child-process environment mapping, and Ansible reads the shared variable directly.
+- Clear the shared password after Packer and Ansible work is complete with `unset AD_LAB_ADMIN_PASSWORD`.
 - Packer temporarily uses Basic, unencrypted WinRM on its isolated build network, then disables it during final shutdown. Runtime automation uses WinRM with NTLM message encryption.
 - `ansible/inventory.ini`, `ansible/known_hosts`, logs, Terraform state/plan files, ISOs, and generated disks are ignored by git.
 - Commit `terraform/.terraform.lock.hcl` so all users select the same provider build.

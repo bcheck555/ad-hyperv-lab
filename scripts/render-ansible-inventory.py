@@ -57,26 +57,28 @@ def terraform_addresses(root: Path) -> list[str]:
     return addresses
 
 
+def render_inventory(vm_name: str, ip: str) -> str:
+    return (
+        "[windows]\n"
+        f"{vm_name} ansible_host={ip} ansible_user=Administrator "
+        "ansible_connection=winrm "
+        "ansible_port=5985 ansible_winrm_transport=ntlm "
+        "ansible_winrm_message_encryption=always\n"
+    )
+
+
 def main() -> None:
     root = repo_root()
+    if not os.environ.get("AD_LAB_ADMIN_PASSWORD"):
+        raise SystemExit("Set AD_LAB_ADMIN_PASSWORD before rendering inventory or running Ansible")
+
     ip = terraform_addresses(root)[0]
     vm_name = str(terraform_output(root, "vm_name")).strip()
     if not vm_name:
         raise SystemExit("Terraform output vm_name is empty")
 
-    password = os.environ.get("AD_LAB_ADMIN_PASSWORD")
-    if not password:
-        raise SystemExit("Set AD_LAB_ADMIN_PASSWORD before rendering inventory")
-
     inventory = root / "ansible" / "inventory.ini"
-    inventory.write_text(
-        "[windows]\n"
-        f"{vm_name} ansible_host={ip} ansible_user=Administrator "
-        f"ansible_password={json.dumps(password)} ansible_connection=winrm "
-        "ansible_port=5985 ansible_winrm_transport=ntlm "
-        "ansible_winrm_message_encryption=always\n",
-        encoding="utf-8",
-    )
+    inventory.write_text(render_inventory(vm_name, ip), encoding="utf-8")
     inventory.chmod(0o600)
     print(f"Wrote {inventory} for {vm_name} at {ip}")
 

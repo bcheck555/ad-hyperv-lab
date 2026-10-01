@@ -8,7 +8,7 @@ output/
 ansible/inventory.ini
 ansible/known_hosts
 terraform/.terraform/
-terraform/*.tfstate
-terraform/*.tfstate.*
-terraform/tfplan
-terraform/*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan

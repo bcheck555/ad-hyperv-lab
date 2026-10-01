@@ -1,0 +1,1 @@
+ansible_password: "{{ lookup('ansible.builtin.env', 'AD_LAB_ADMIN_PASSWORD', default=undef(hint='Set AD_LAB_ADMIN_PASSWORD in the environment before running Ansible.')) }}"
